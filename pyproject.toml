@@ -7,6 +7,7 @@ name = "ripweaver-catalogue"
 version = "0.1.0"
 description = "Privacy-safe public disc catalogue API for RipWeaver"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
   "alembic>=1.14,<2",
   "fastapi>=0.115,<1",

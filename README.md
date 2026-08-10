@@ -80,5 +80,4 @@ attachments, media upload, and direct database access are out of scope.
 
 ## Licensing
 
-No project license has been selected yet. Add one deliberately before accepting
-external contributions or publishing reusable source packages.
+Distributed under the MIT License. See `LICENSE` for details.
