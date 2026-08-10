@@ -22,6 +22,20 @@ class Base(DeclarativeBase):
     pass
 
 
+class Installation(Base):
+    __tablename__ = "installations"
+
+    installation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    token_sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class CatalogueDisc(Base):
     __tablename__ = "catalogue_discs"
 
@@ -99,6 +113,9 @@ class Submission(Base):
     )
 
     submission_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    installation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("installations.installation_id"), nullable=True, index=True
+    )
     content_hash: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
@@ -110,3 +127,96 @@ class Submission(Base):
         DateTime(timezone=True), nullable=False, default=utc_now
     )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CreditLedgerEntry(Base):
+    __tablename__ = "credit_ledger"
+    __table_args__ = (
+        UniqueConstraint(
+            "installation_id",
+            "reason",
+            "reference_id",
+            "bucket",
+            name="uq_credit_reference",
+        ),
+    )
+
+    entry_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.installation_id"), nullable=False, index=True
+    )
+    bucket: Mapped[str] = mapped_column(String(16), nullable=False)
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    reference_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class LookupEvent(Base):
+    __tablename__ = "lookup_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "installation_id",
+            "idempotency_key_sha256",
+            name="uq_lookup_idempotency",
+        ),
+    )
+
+    lookup_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.installation_id"), nullable=False, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(32), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    credit_source: Mapped[str] = mapped_column(String(16), nullable=False)
+    idempotency_key_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    support_prompt_version: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, index=True
+    )
+
+
+class SupportOrder(Base):
+    __tablename__ = "support_orders"
+    __table_args__ = (
+        UniqueConstraint(
+            "installation_id",
+            "idempotency_key_sha256",
+            name="uq_support_order_idempotency",
+        ),
+    )
+
+    order_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.installation_id"), nullable=False, index=True
+    )
+    idempotency_key_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    support_rate_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    credit_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    terms_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    terms_accepted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    provider_session_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    checkout_url: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PaymentEvent(Base):
+    __tablename__ = "payment_events"
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider_object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )

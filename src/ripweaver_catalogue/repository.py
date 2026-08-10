@@ -49,6 +49,7 @@ def submit_proposal(
     session: Session,
     payload: DiscSubmissionInput,
     *,
+    installation_id: str | None,
     idempotency_key: str,
     client_version: str,
 ) -> SubmissionReceipt:
@@ -68,6 +69,7 @@ def submit_proposal(
 
     row = Submission(
         submission_id=str(uuid.uuid4()),
+        installation_id=installation_id,
         content_hash=payload.content_hash,
         payload_sha256=payload_sha256,
         payload_json=encoded,
@@ -129,6 +131,8 @@ def list_submissions(
 
 
 def approve_submission(session: Session, submission_id: str) -> DiscRecord:
+    from .accounts import grant_contribution_credit
+
     submission = session.get(Submission, submission_id)
     if submission is None:
         raise CatalogueNotFoundError("Submission does not exist")
@@ -164,6 +168,11 @@ def approve_submission(session: Session, submission_id: str) -> DiscRecord:
         disc.latest_revision = duplicate.revision
         submission.status = "approved"
         submission.reviewed_at = now
+        grant_contribution_credit(
+            session,
+            installation_id=submission.installation_id,
+            submission_id=submission.submission_id,
+        )
         session.commit()
         result = get_disc(session, payload.content_hash)
         if result is None:
@@ -203,6 +212,11 @@ def approve_submission(session: Session, submission_id: str) -> DiscRecord:
     disc.latest_revision = next_revision
     submission.status = "approved"
     submission.reviewed_at = now
+    grant_contribution_credit(
+        session,
+        installation_id=submission.installation_id,
+        submission_id=submission.submission_id,
+    )
     try:
         session.commit()
     except IntegrityError as exc:

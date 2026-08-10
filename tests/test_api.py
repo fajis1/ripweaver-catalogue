@@ -10,7 +10,6 @@ from ripweaver_catalogue.config import Settings
 from ripweaver_catalogue.main import create_app
 from ripweaver_catalogue.models import Base
 
-SUBMISSION_TOKEN = "submission-token-that-is-at-least-32-characters"
 ADMIN_TOKEN = "admin-token-that-is-distinct-and-at-least-32-characters"
 CONTENT_HASH = "0123456789ABCDEF0123456789ABCDEF"
 
@@ -25,7 +24,6 @@ def client() -> Iterator[TestClient]:
     Base.metadata.create_all(engine)
     settings = Settings(
         database_url=SecretStr("sqlite+pysqlite://"),
-        submission_token=SecretStr(SUBMISSION_TOKEN),
         admin_token=SecretStr(ADMIN_TOKEN),
         allowed_hosts=["testserver"],
     )
@@ -60,12 +58,26 @@ def proposal() -> dict[str, object]:
     }
 
 
-def submission_headers(*, key: str = "stable-idempotency-key-0001") -> dict[str, str]:
+def installation_headers(client: TestClient) -> dict[str, str]:
+    registered = client.post("/v1/installations/register")
+    assert registered.status_code == 201
+    return {"Authorization": f"Bearer {registered.json()['access_token']}"}
+
+
+def submission_headers(
+    client: TestClient, *, key: str = "stable-idempotency-key-0001"
+) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {SUBMISSION_TOKEN}",
+        **installation_headers(client),
         "Idempotency-Key": key,
         "X-RipWeaver-Version": "1.3.6-test",
     }
+
+
+def lookup_headers(
+    authentication: dict[str, str], *, key: str = "stable-lookup-key-0001"
+) -> dict[str, str]:
+    return {**authentication, "Idempotency-Key": key}
 
 
 def admin_headers() -> dict[str, str]:
@@ -76,14 +88,27 @@ def test_health_and_schema_are_public(client: TestClient) -> None:
     assert client.get("/health/live").json() == {"status": "live"}
     assert client.get("/health/ready").json() == {"status": "ready"}
     schema = client.get("/v1/schema").json()
-    assert schema["schema_version"] == 1
+    assert schema["schema_version"] == 2
+    assert schema["public_lookup"] is False
+    assert schema["metered_lookup"] is True
+    assert schema["support_checkout"] is False
     assert schema["attachments_accepted"] is False
     assert schema["media_accepted"] is False
     assert client.get("/openapi.json").status_code == 404
+    policy = client.get("/v1/support/policy").json()
+    assert policy["minimum_amount_cents"] == 1000
+    assert policy["minimum_rate_cents"] == 1
+    assert policy["maximum_rate_cents"] == 100
+    assert policy["payments_enabled"] is False
 
 
 def test_unknown_disc_is_not_found(client: TestClient) -> None:
-    response = client.get(f"/v1/discs/{CONTENT_HASH}")
+    authentication = installation_headers(client)
+    response = client.post(
+        f"/v1/lookups/discs/{CONTENT_HASH}",
+        json={"mode": "automatic"},
+        headers=lookup_headers(authentication),
+    )
     assert response.status_code == 404
     assert response.json() == {"detail": "Disc is not catalogued"}
 
@@ -101,14 +126,28 @@ def test_submission_requires_authentication(client: TestClient) -> None:
 
 
 def test_submission_remains_private_until_approved(client: TestClient) -> None:
+    authentication = installation_headers(client)
     response = client.post(
-        "/v1/submissions", json=proposal(), headers=submission_headers()
+        "/v1/submissions",
+        json=proposal(),
+        headers={
+            **authentication,
+            "Idempotency-Key": "stable-idempotency-key-0001",
+            "X-RipWeaver-Version": "1.3.6-test",
+        },
     )
     assert response.status_code == 202
     receipt = response.json()
     assert receipt["content_hash"] == CONTENT_HASH
     assert receipt["status"] == "pending"
-    assert client.get(f"/v1/discs/{CONTENT_HASH}").status_code == 404
+    assert (
+        client.post(
+            f"/v1/lookups/discs/{CONTENT_HASH}",
+            json={"mode": "automatic"},
+            headers=lookup_headers(authentication),
+        ).status_code
+        == 404
+    )
 
     pending = client.get("/v1/admin/submissions", headers=admin_headers()).json()
     assert [item["submission_id"] for item in pending] == [receipt["submission_id"]]
@@ -122,17 +161,23 @@ def test_submission_remains_private_until_approved(client: TestClient) -> None:
     assert approved.json()["revision"] == 1
     assert approved.json()["status"] == "reviewed"
 
-    public = client.get(f"/v1/discs/{CONTENT_HASH}")
-    assert public.status_code == 200
-    assert public.headers["cache-control"] == "public, max-age=300"
-    assert public.headers["etag"] == f'"{receipt["payload_sha256"]}"'
-    assert public.json()["titles"][0]["episode_number"] == 1
+    lookup = client.post(
+        f"/v1/lookups/discs/{CONTENT_HASH}",
+        json={"mode": "automatic"},
+        headers=lookup_headers(authentication, key="approved-lookup-key-0001"),
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["disc"]["titles"][0]["episode_number"] == 1
+    assert lookup.json()["credit_source"] == "monthly"
+    usage = client.get("/v1/account/usage", headers=authentication).json()
+    assert usage["monthly_used"] == 1
+    assert usage["contribution_credits"] == 1
 
 
 def test_idempotency_key_cannot_be_reused_for_different_payload(
     client: TestClient,
 ) -> None:
-    headers = submission_headers()
+    headers = submission_headers(client)
     first = client.post("/v1/submissions", json=proposal(), headers=headers)
     assert first.status_code == 202
     changed = proposal()
@@ -151,7 +196,9 @@ def test_submission_rejects_paths(client: TestClient, unsafe_source: str) -> Non
     response = client.post(
         "/v1/submissions",
         json=payload,
-        headers=submission_headers(key=f"path-rejection-{len(unsafe_source):04d}"),
+        headers=submission_headers(
+            client, key=f"path-rejection-{len(unsafe_source):04d}"
+        ),
     )
     assert response.status_code == 422
 
@@ -162,7 +209,7 @@ def test_submission_rejects_unknown_private_fields(client: TestClient) -> None:
     response = client.post(
         "/v1/submissions",
         json=payload,
-        headers=submission_headers(key="private-field-rejection-0001"),
+        headers=submission_headers(client, key="private-field-rejection-0001"),
     )
     assert response.status_code == 422
 
@@ -171,7 +218,7 @@ def test_admin_can_reject_with_path_free_reason(client: TestClient) -> None:
     created = client.post(
         "/v1/submissions",
         json=proposal(),
-        headers=submission_headers(key="rejection-idempotency-key-0001"),
+        headers=submission_headers(client, key="rejection-idempotency-key-0001"),
     ).json()
     rejected = client.post(
         f"/v1/admin/submissions/{created['submission_id']}/reject",
@@ -180,4 +227,12 @@ def test_admin_can_reject_with_path_free_reason(client: TestClient) -> None:
     )
     assert rejected.status_code == 200
     assert rejected.json()["status"] == "rejected"
-    assert client.get(f"/v1/discs/{CONTENT_HASH}").status_code == 404
+    authentication = installation_headers(client)
+    assert (
+        client.post(
+            f"/v1/lookups/discs/{CONTENT_HASH}",
+            json={"mode": "automatic"},
+            headers=lookup_headers(authentication, key="rejected-lookup-key-0001"),
+        ).status_code
+        == 404
+    )

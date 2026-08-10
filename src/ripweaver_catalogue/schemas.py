@@ -141,3 +141,82 @@ class DiscRecord(StrictModel):
 
 class RejectionRequest(StrictModel):
     reason_code: str = Field(pattern=r"^[a-z][a-z0-9_]{2,63}$")
+
+
+class InstallationReceipt(StrictModel):
+    installation_id: str
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+
+
+class UsageSummary(StrictModel):
+    monthly_limit: int
+    monthly_used: int
+    monthly_remaining: int
+    contribution_credits: int
+    purchased_credits: int
+    total_automatic_remaining: int
+
+
+class LookupRequest(StrictModel):
+    mode: Literal["automatic", "manual"] = "automatic"
+    support_prompt_version: str | None = Field(default=None, max_length=32)
+
+    @model_validator(mode="after")
+    def manual_mode_requires_prompt_version(self) -> "LookupRequest":
+        if self.mode == "manual" and self.support_prompt_version is None:
+            raise ValueError(
+                "manual lookup requires the displayed support prompt version"
+            )
+        if self.mode == "automatic" and self.support_prompt_version is not None:
+            raise ValueError("automatic lookup cannot acknowledge a support prompt")
+        return self
+
+
+class LookupResponse(StrictModel):
+    disc: DiscRecord
+    usage: UsageSummary
+    credit_source: Literal["monthly", "contribution", "purchased", "manual", "cached"]
+
+
+class SupportPolicy(StrictModel):
+    policy_version: str
+    terms_version: str
+    currency: Literal["usd"] = "usd"
+    minimum_amount_cents: int
+    minimum_rate_cents: int
+    maximum_rate_cents: int
+    default_rate_cents: int
+    monthly_automatic_lookups: int
+    payments_enabled: bool
+    support_message: str
+    availability_disclosure: str
+    refund_disclosure: str
+
+
+class SupportRequired(StrictModel):
+    code: Literal["support_confirmation_required"] = "support_confirmation_required"
+    message: str
+    usage: UsageSummary
+    policy: SupportPolicy
+
+
+class SupportCheckoutInput(StrictModel):
+    amount_cents: int = Field(ge=100, le=100_000)
+    support_rate_cents: int = Field(ge=1, le=100)
+    terms_version: str = Field(max_length=32)
+    accept_best_effort_terms: Literal[True]
+
+
+class SupportCheckoutReceipt(StrictModel):
+    order_id: str
+    amount_cents: int
+    support_rate_cents: int
+    automatic_lookup_credits: int
+    currency: Literal["usd"] = "usd"
+    checkout_url: str
+    status: Literal["checkout_created", "paid"]
+
+
+class PaymentWebhookReceipt(StrictModel):
+    received: Literal[True] = True
