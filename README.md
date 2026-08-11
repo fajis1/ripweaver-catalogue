@@ -7,22 +7,47 @@ Cloudflare Tunnel.
 ## Security boundary
 
 The API accepts structural disc metadata only: a content identifier, media
-type, source playlist/file identifiers, segment maps, runtimes, sizes, and
-reviewed movie/episode classifications. Validation rejects local paths and the
+type, source playlist/file identifiers, segment maps, runtimes, sizes, match
+provenance, and movie/episode classifications. Validation rejects local paths and the
 schema has no fields for media, transcripts, screenshots, drive serials,
 Jellyfin details, credentials, or command output.
 
-Lookups return only approved revisions. Each RipWeaver installation receives an
-opaque bearer token; only its SHA-256 digest is stored by the server. Submissions
-remain pending until separately approved with the admin token. Provider secrets
-and the database URL are loaded from `.env` and are never stored in API records
-or responses.
+Lookups return only legacy approved revisions or title-level results confirmed
+by automatic consensus. Each RipWeaver installation receives an opaque bearer
+token; only its SHA-256 digest is stored by the server. Submissions from current
+clients are evaluated automatically and need no owner moderation. Provider
+secrets and the database URL are loaded from `.env` and are never stored in API
+records or responses.
+
+## Hybrid consensus
+
+Consensus is piecewise rather than all-or-nothing. Each title index first needs
+agreement on its structural identity (playlist, segment map, runtime, and size),
+then on its semantic assignment. A winner requires at least two independent
+installations and must strictly lead the runner-up. One matching upload is only
+a candidate; 1-1 and 2-2 ties are disputed; 2-1 and 3-2 majorities are confirmed.
+This lets RipWeaver use 95% of a disc safely while continuing local matching for
+one disputed bonus item.
+
+After title voting, a whole-disc consistency pass checks relationships such as
+duplicate episode assignments and play-all references. Only affected titles are
+held. Cosmetic title differences do not split a semantic vote. When matching
+claims use different display wording, provenance chooses the label in this
+order: manual playback, deterministic mapping, strong local evidence, Gemini,
+then server-assisted evidence.
+
+`GET /v1/help/discs/{content_hash}` exposes path-free candidate evidence when a
+desktop matcher is confused. It is free and does not make a candidate automatic.
+Any result derived from that endpoint must be contributed as `server_assisted`,
+which cannot form quorum or earn credit. This prevents the catalogue from
+confirming its own suggestion. If even one title in a disc layout used server
+help, that layout receives no exchange credit.
 
 ## Lookup credits and voluntary support
 
 Each installation receives 10 automatic successful catalogue lookups per UTC
-calendar month. An approved disc contribution earns one non-expiring automatic
-lookup credit. Failed and not-found lookups do not consume anything. After the
+calendar month. A qualifying consensus contribution earns one non-expiring
+automatic lookup credit. Failed and not-found lookups do not consume anything. After the
 monthly allowance and earned or purchased credits are exhausted, the API
 returns a visible support-required decision; the person may still continue that
 specific lookup manually without paying.
@@ -107,17 +132,18 @@ be copied, encrypted, to storage outside the VM and tested with a restore drill.
 - `POST /v1/installations/register` — issue a new installation token once
 - `GET /v1/support/policy` — public prices, limits, and best-effort disclosures
 - `GET /v1/account/usage` — authenticated allowance and credit balance
-- `POST /v1/lookups/discs/{content_hash}` — authenticated automatic/manual lookup
+- `POST /v1/lookups/discs/{content_hash}` — confirmed automatic/manual lookup
+- `GET /v1/help/discs/{content_hash}` — unmetered provisional candidate help
 - `POST /v1/support/checkout` — disabled-until-configured hosted checkout
 - `POST /v1/payments/stripe/webhook` — signature-verified fulfillment boundary
-- `POST /v1/submissions` — authenticated pending proposal
-- `GET /v1/admin/submissions` — authenticated moderation list
-- `POST /v1/admin/submissions/{id}/approve` — publish a revision
-- `POST /v1/admin/submissions/{id}/reject` — reject with a path-free reason code
+- `POST /v1/submissions` — authenticated automatic schema-v2 contribution
+- `GET /v1/admin/submissions` — legacy schema-v1 moderation list
+- `POST /v1/admin/submissions/{id}/approve` — publish a legacy revision
+- `POST /v1/admin/submissions/{id}/reject` — reject a legacy proposal
 
 The API is intentionally narrow. It uses pseudonymous installation identity,
-not personal profiles or email accounts. Automated trust, attachments, media
-upload, and direct database access are out of scope. Reinstalling without
+not personal profiles or email accounts. Attachments, media upload, personal
+profiles, and direct database access are out of scope. Reinstalling without
 preserving the local token creates a new identity; this is acceptable because
 manual lookups remain available and the support prompt is not a hard paywall.
 

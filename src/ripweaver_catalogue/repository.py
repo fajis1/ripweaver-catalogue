@@ -1,4 +1,4 @@
-"""Transactional catalogue and moderation operations."""
+"""Transactional catalogue, consensus, and legacy moderation operations."""
 
 import hashlib
 import json
@@ -9,6 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .consensus import (
+    add_assertions,
+    consensus_summary,
+    get_consensus_disc,
+    lock_consensus_scope,
+    recompute_consensus,
+)
 from .models import CatalogueDisc, DiscRevision, DiscTitle, Submission
 from .schemas import (
     DiscRecord,
@@ -36,12 +43,17 @@ def canonical_payload(payload: DiscSubmissionInput) -> tuple[str, str]:
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _receipt(row: Submission) -> SubmissionReceipt:
+def _receipt(session: Session, row: Submission) -> SubmissionReceipt:
     return SubmissionReceipt(
         submission_id=row.submission_id,
         content_hash=row.content_hash,
         payload_sha256=row.payload_sha256,
         status=row.status,
+        consensus=(
+            consensus_summary(session, row.content_hash)
+            if row.status == "accepted"
+            else None
+        ),
     )
 
 
@@ -52,6 +64,7 @@ def submit_proposal(
     installation_id: str | None,
     idempotency_key: str,
     client_version: str,
+    consensus_credit_threshold: float = 0.90,
 ) -> SubmissionReceipt:
     encoded, payload_sha256 = canonical_payload(payload)
     idempotency_sha256 = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
@@ -65,7 +78,7 @@ def submit_proposal(
             raise CatalogueConflictError(
                 "Idempotency key was already used for a different proposal"
             )
-        return _receipt(existing)
+        return _receipt(session, existing)
 
     row = Submission(
         submission_id=str(uuid.uuid4()),
@@ -75,21 +88,39 @@ def submit_proposal(
         payload_json=encoded,
         idempotency_key_sha256=idempotency_sha256,
         client_version=client_version,
-        status="pending",
+        status="accepted" if payload.schema_version == 2 else "pending",
     )
-    session.add(row)
     try:
+        if payload.schema_version == 2:
+            if installation_id is None:
+                raise CatalogueConflictError(
+                    "Consensus contributions require an installation identity"
+                )
+            lock_consensus_scope(session, payload.content_hash)
+        session.add(row)
+        if payload.schema_version == 2:
+            session.flush()
+            add_assertions(session, row, payload)
+            session.flush()
+            recompute_consensus(
+                session,
+                payload.content_hash,
+                credit_threshold=consensus_credit_threshold,
+            )
         session.commit()
     except IntegrityError as exc:
         session.rollback()
         raise CatalogueConflictError(
             "Proposal could not be stored idempotently"
         ) from exc
-    return _receipt(row)
+    return _receipt(session, row)
 
 
 def get_disc(session: Session, content_hash: str) -> DiscRecord | None:
     normalized = content_hash.upper()
+    consensus = get_consensus_disc(session, normalized)
+    if consensus is not None:
+        return consensus
     disc = session.get(CatalogueDisc, normalized)
     if disc is None or disc.latest_revision < 1:
         return None
@@ -120,7 +151,7 @@ def list_submissions(
     ).all()
     return tuple(
         SubmissionSummary(
-            **_receipt(row).model_dump(),
+            **_receipt(session, row).model_dump(),
             client_version=row.client_version,
             rejection_code=row.rejection_code,
             created_at=row.created_at.isoformat(),
@@ -239,11 +270,11 @@ def reject_submission(
             raise CatalogueConflictError(
                 "Submission was already rejected with a different reason"
             )
-        return _receipt(submission)
+        return _receipt(session, submission)
     if submission.status != "pending":
         raise CatalogueConflictError("Only pending submissions can be rejected")
     submission.status = "rejected"
     submission.rejection_code = reason_code
     submission.reviewed_at = datetime.now(UTC)
     session.commit()
-    return _receipt(submission)
+    return _receipt(session, submission)

@@ -30,6 +30,21 @@ class TitleClassification(StrEnum):
     UNKNOWN = "unknown"
 
 
+class MatchSource(StrEnum):
+    MANUAL_PLAYBACK = "manual_playback"
+    DETERMINISTIC = "deterministic"
+    LOCAL_EVIDENCE = "local_evidence"
+    GEMINI = "gemini"
+    SERVER_ASSISTED = "server_assisted"
+
+
+class ConsensusState(StrEnum):
+    CANDIDATE = "candidate"
+    CONFIRMED = "confirmed"
+    DISPUTED = "disputed"
+    INCONSISTENT = "inconsistent"
+
+
 class DiscTitleInput(StrictModel):
     title_index: int = Field(ge=0, le=9999)
     source_file: str = Field(min_length=1, max_length=96)
@@ -43,6 +58,9 @@ class DiscTitleInput(StrictModel):
     episode_title: str | None = Field(default=None, max_length=300)
     movie_title: str | None = Field(default=None, max_length=300)
     movie_year: int | None = Field(default=None, ge=1870, le=2200)
+    display_title: str | None = Field(default=None, max_length=300)
+    contained_title_indexes: tuple[int, ...] = Field(default=(), max_length=1000)
+    match_source: MatchSource | None = None
 
     @field_validator("source_file")
     @classmethod
@@ -89,11 +107,20 @@ class DiscTitleInput(StrictModel):
             raise ValueError(
                 "non-episode and non-movie titles cannot contain assignment fields"
             )
+        if len(self.contained_title_indexes) != len(set(self.contained_title_indexes)):
+            raise ValueError("contained title indexes must be unique")
+        if self.title_index in self.contained_title_indexes:
+            raise ValueError("a title cannot contain itself")
+        if (
+            self.classification != TitleClassification.PLAY_ALL
+            and self.contained_title_indexes
+        ):
+            raise ValueError("only play-all titles can contain other title indexes")
         return self
 
 
 class DiscSubmissionInput(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     content_hash: ContentHash
     media_type: MediaType
     release_name: str | None = Field(default=None, max_length=300)
@@ -110,14 +137,41 @@ class DiscSubmissionInput(StrictModel):
         indexes = [title.title_index for title in self.titles]
         if len(indexes) != len(set(indexes)):
             raise ValueError("title indexes must be unique")
+        if self.schema_version == 2 and any(
+            title.match_source is None for title in self.titles
+        ):
+            raise ValueError("schema version 2 requires a match source for every title")
+        available = set(indexes)
+        for title in self.titles:
+            if not set(title.contained_title_indexes).issubset(available):
+                raise ValueError("contained title indexes must exist on the same disc")
         return self
+
+
+class ConsensusItemStatus(StrictModel):
+    title_index: int
+    state: ConsensusState
+    support_count: int
+    runner_up_count: int
+    candidate_count: int
+
+
+class ConsensusSummary(StrictModel):
+    quorum: Literal[2] = 2
+    total_items: int
+    confirmed_items: int
+    unresolved_items: int
+    whole_disc_consistent: bool
+    complete: bool
+    items: tuple[ConsensusItemStatus, ...]
 
 
 class SubmissionReceipt(StrictModel):
     submission_id: str
     content_hash: str
     payload_sha256: str
-    status: Literal["pending", "approved", "rejected"]
+    status: Literal["pending", "accepted", "approved", "rejected"]
+    consensus: ConsensusSummary | None = None
 
 
 class SubmissionSummary(SubmissionReceipt):
@@ -128,7 +182,7 @@ class SubmissionSummary(SubmissionReceipt):
 
 
 class DiscRecord(StrictModel):
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     content_hash: str
     media_type: MediaType
     release_name: str | None
@@ -136,7 +190,29 @@ class DiscRecord(StrictModel):
     titles: tuple[DiscTitleInput, ...]
     revision: int
     payload_sha256: str
-    status: Literal["reviewed"] = "reviewed"
+    status: Literal["reviewed", "consensus"] = "reviewed"
+    consensus: ConsensusSummary | None = None
+
+
+class ConsensusCandidate(StrictModel):
+    title: DiscTitleInput
+    independent_support: int
+    total_observations: int
+    best_match_source: MatchSource
+
+
+class ConsensusHelpItem(StrictModel):
+    title_index: int
+    state: ConsensusState
+    candidates: tuple[ConsensusCandidate, ...]
+
+
+class DiscHelpRecord(StrictModel):
+    schema_version: Literal[2] = 2
+    content_hash: str
+    media_type: MediaType
+    total_items: int
+    items: tuple[ConsensusHelpItem, ...]
 
 
 class RejectionRequest(StrictModel):

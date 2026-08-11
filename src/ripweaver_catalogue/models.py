@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -127,6 +128,73 @@ class Submission(Base):
         DateTime(timezone=True), nullable=False, default=utc_now
     )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ConsensusAssertion(Base):
+    __tablename__ = "consensus_assertions"
+    __table_args__ = (
+        UniqueConstraint(
+            "submission_id", "title_index", name="uq_assertion_submission_title"
+        ),
+    )
+
+    assertion_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    submission_id: Mapped[str] = mapped_column(
+        ForeignKey("submissions.submission_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.installation_id"), nullable=False, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    structural_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    assignment_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    title_json: Mapped[str] = mapped_column(Text, nullable=False)
+    match_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    independent: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ConsensusDisc(Base):
+    __tablename__ = "consensus_discs"
+
+    content_hash: Mapped[str] = mapped_column(String(32), primary_key=True)
+    media_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    release_name: Mapped[str | None] = mapped_column(String(300))
+    edition: Mapped[str | None] = mapped_column(String(200))
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    confirmed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unresolved_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    whole_disc_consistent: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    payload_sha256: Mapped[str | None] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class ConsensusItem(Base):
+    __tablename__ = "consensus_items"
+
+    content_hash: Mapped[str] = mapped_column(
+        ForeignKey("consensus_discs.content_hash", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    title_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    winning_structural_key: Mapped[str | None] = mapped_column(String(64))
+    winning_assignment_key: Mapped[str | None] = mapped_column(String(64))
+    support_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    runner_up_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    winning_title_json: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
 
 
 class CreditLedgerEntry(Base):

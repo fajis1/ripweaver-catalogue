@@ -6,15 +6,32 @@ This service is a public metadata boundary. Preserve these rules:
 - Public responses must not contain absolute paths, media locations, drive
   identities, credentials, private network details, or command environments.
 - Never accept media, screenshots, transcripts, logs, or arbitrary attachments.
-- Public lookup is read-only and returns reviewed revisions only.
-- Lookup charging must count only successful reviewed responses. Retries are
+- Public lookup is read-only and returns only legacy reviewed revisions or
+  title-level results confirmed by automatic consensus.
+- Lookup charging must count only successful confirmed responses. Retries are
   idempotent, misses are free, and manual continuation remains available after
   the visible support prompt.
 - Credit changes are append-only. Payment credits require a verified, exact-
   amount, idempotent webhook and must never be granted from a browser redirect.
 - Support payments are disabled by default. Never enable them, contact Stripe,
   or use live payment credentials during tests.
-- Contributions enter a pending queue and require separate moderation.
+- Schema-v2 contributions are accepted automatically. A title is confirmed
+  only when at least two independent installations submit the same structural
+  identity and semantic assignment and that group strictly leads every
+  alternative. Ties are disputed and must suspend that title only.
+- Server-assisted matches may be returned as provisional help but never count
+  toward quorum or contribution credit. Evidence provenance may select a
+  display label inside one semantic group, but may never break a semantic vote
+  tie.
+- Whole-disc consistency checks must preserve confirmed independent items and
+  demote only affected conflicts. Never make one bonus-title disagreement hide
+  unrelated confirmed episodes.
+- Contribution credits are append-only, limited to one per installation and
+  disc fingerprint, and require the configured fraction of that installation's
+  independent assertions to participate in confirmed winners. They are never
+  clawed back if later evidence changes consensus.
+- Schema-v1 pending moderation remains only for backward compatibility with
+  legacy reviewed revisions; new clients must use automatic schema v2.
 - Keep credentials in ignored environment state; never open, print, or commit
   `.env`.
 - Database migrations must be explicit and reviewable. Do not auto-create or

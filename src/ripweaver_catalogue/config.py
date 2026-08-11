@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     submission_token: SecretStr | None = None
     admin_token: SecretStr | None = None
     monthly_automatic_lookups: int = Field(default=10, ge=0, le=10_000)
+    consensus_credit_threshold: float = Field(default=0.90, ge=0.50, le=1.0)
     support_minimum_cents: int = Field(default=1_000, ge=100, le=100_000)
     support_rate_min_cents: int = Field(default=1, ge=1, le=100)
     support_rate_max_cents: int = Field(default=100, ge=1, le=100)

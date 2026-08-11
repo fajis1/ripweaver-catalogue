@@ -27,6 +27,7 @@ from .accounts import (
 )
 from .auth import bearer_dependency
 from .config import Settings, get_settings
+from .consensus import get_consensus_help
 from .database import build_engine, build_session_factory, session_dependency
 from .models import Installation
 from .payments import CheckoutProvider, PaymentProviderError, StripeCheckoutProvider
@@ -39,6 +40,7 @@ from .repository import (
     submit_proposal,
 )
 from .schemas import (
+    DiscHelpRecord,
     DiscRecord,
     DiscSubmissionInput,
     InstallationReceipt,
@@ -58,7 +60,7 @@ from .support import build_support_policy
 
 
 class SchemaCapabilities(BaseModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     service_version: str
     public_lookup: bool = False
     installation_registration: bool = True
@@ -67,6 +69,10 @@ class SchemaCapabilities(BaseModel):
     contribution_credits: bool = True
     support_checkout: bool
     authenticated_submissions: bool = True
+    automatic_piecewise_consensus: bool = True
+    provisional_help: bool = True
+    independent_quorum: Literal[2] = 2
+    human_moderation_required: bool = False
     attachments_accepted: bool = False
     media_accepted: bool = False
 
@@ -201,6 +207,19 @@ def create_app(
             raise HTTPException(status_code=404, detail="Disc is not catalogued")
         return result
 
+    @application.get("/v1/help/discs/{content_hash}", response_model=DiscHelpRecord)
+    def help_with_disc(
+        content_hash: str,
+        session: SessionDependency,
+        _installation: Annotated[Installation, Depends(require_installation)],
+    ) -> DiscHelpRecord:
+        if re.fullmatch(r"[0-9A-Fa-f]{32}", content_hash) is None:
+            raise HTTPException(status_code=422, detail="Content hash is invalid")
+        result = get_consensus_help(session, content_hash)
+        if result is None:
+            raise HTTPException(status_code=404, detail="No candidate evidence exists")
+        return result
+
     @application.post("/v1/support/checkout", response_model=SupportCheckoutReceipt)
     def create_support_checkout(
         payload: SupportCheckoutInput,
@@ -290,6 +309,9 @@ def create_app(
                 installation_id=installation.installation_id,
                 idempotency_key=idempotency_key,
                 client_version=client_version,
+                consensus_credit_threshold=(
+                    selected_settings.consensus_credit_threshold
+                ),
             )
         except CatalogueConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -302,7 +324,8 @@ def create_app(
     def pending_submissions(
         session: SessionDependency,
         submission_status: Annotated[
-            Literal["pending", "approved", "rejected"], Query(alias="status")
+            Literal["pending", "accepted", "approved", "rejected"],
+            Query(alias="status"),
         ] = "pending",
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
     ) -> tuple[SubmissionSummary, ...]:

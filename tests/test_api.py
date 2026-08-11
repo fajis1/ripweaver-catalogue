@@ -88,10 +88,14 @@ def test_health_and_schema_are_public(client: TestClient) -> None:
     assert client.get("/health/live").json() == {"status": "live"}
     assert client.get("/health/ready").json() == {"status": "ready"}
     schema = client.get("/v1/schema").json()
-    assert schema["schema_version"] == 2
+    assert schema["schema_version"] == 3
     assert schema["public_lookup"] is False
     assert schema["metered_lookup"] is True
     assert schema["support_checkout"] is False
+    assert schema["automatic_piecewise_consensus"] is True
+    assert schema["provisional_help"] is True
+    assert schema["independent_quorum"] == 2
+    assert schema["human_moderation_required"] is False
     assert schema["attachments_accepted"] is False
     assert schema["media_accepted"] is False
     assert client.get("/openapi.json").status_code == 404
