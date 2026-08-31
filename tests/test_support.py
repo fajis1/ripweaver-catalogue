@@ -4,12 +4,19 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from ripweaver_catalogue.config import Settings
 from ripweaver_catalogue.main import create_app
 from ripweaver_catalogue.models import Base
 from ripweaver_catalogue.payments import CheckoutSession, VerifiedPaymentEvent
+from ripweaver_catalogue.repository import (
+    approve_submission,
+    record_trusted_legacy_proposal,
+)
+from ripweaver_catalogue.schemas import DiscSubmissionInput
 
 ADMIN_TOKEN = "admin-token-that-is-distinct-and-at-least-32-characters"
 CONTENT_HASH = "0123456789ABCDEF0123456789ABCDEF"
@@ -43,7 +50,7 @@ class FakeCheckoutProvider:
 
 
 @pytest.fixture
-def client_and_provider() -> Iterator[tuple[TestClient, FakeCheckoutProvider]]:
+def client_and_provider() -> Iterator[tuple[TestClient, FakeCheckoutProvider, Engine]]:
     engine = create_engine(
         "sqlite+pysqlite://",
         connect_args={"check_same_thread": False},
@@ -63,7 +70,7 @@ def client_and_provider() -> Iterator[tuple[TestClient, FakeCheckoutProvider]]:
     with TestClient(
         create_app(settings=settings, engine=engine, checkout_provider=provider)
     ) as client:
-        yield client, provider
+        yield client, provider, engine
     engine.dispose()
 
 
@@ -99,23 +106,19 @@ def proposal(content_hash: str = CONTENT_HASH) -> dict[str, object]:
     }
 
 
-def seed_reviewed_discs(client: TestClient, *content_hashes: str) -> None:
-    contributor = register(client)
+def seed_reviewed_discs(engine: Engine, *content_hashes: str) -> None:
     for index, content_hash in enumerate(content_hashes, start=1):
-        created = client.post(
-            "/v1/submissions",
-            json=proposal(content_hash),
-            headers={
-                **contributor,
-                "Idempotency-Key": f"seed-submission-key-{index:04d}",
-                "X-RipWeaver-Version": "test",
-            },
-        ).json()
-        approved = client.post(
-            f"/v1/admin/submissions/{created['submission_id']}/approve",
-            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
-        )
-        assert approved.status_code == 200
+        with Session(engine) as session:
+            created = record_trusted_legacy_proposal(
+                session,
+                DiscSubmissionInput.model_validate(proposal(content_hash)),
+                trusted_internal=True,
+                installation_id=None,
+                idempotency_key=f"trusted-test-seed-{index:04d}",
+                client_version="trusted-test-seed",
+            )
+            approved = approve_submission(session, created.submission_id)
+            assert approved.status == "reviewed"
 
 
 def lookup(
@@ -139,8 +142,8 @@ def lookup(
 def test_quota_requires_visible_prompt_but_manual_lookup_remains_available(
     client_and_provider,
 ) -> None:
-    client, _provider = client_and_provider
-    seed_reviewed_discs(client, CONTENT_HASH, SECOND_CONTENT_HASH)
+    client, _provider, engine = client_and_provider
+    seed_reviewed_discs(engine, CONTENT_HASH, SECOND_CONTENT_HASH)
     user = register(client)
 
     first = lookup(client, user, key="lookup-monthly-key-0001")
@@ -179,7 +182,7 @@ def test_quota_requires_visible_prompt_but_manual_lookup_remains_available(
 def test_support_checkout_uses_selected_rate_and_fulfills_once(
     client_and_provider,
 ) -> None:
-    client, provider = client_and_provider
+    client, provider, _engine = client_and_provider
     user = register(client)
     checkout = client.post(
         "/v1/support/checkout",
@@ -209,7 +212,7 @@ def test_support_checkout_uses_selected_rate_and_fulfills_once(
 
 
 def test_checkout_rejects_old_terms_and_below_minimum(client_and_provider) -> None:
-    client, _provider = client_and_provider
+    client, _provider, _engine = client_and_provider
     user = register(client)
     common_headers = {**user, "Idempotency-Key": "support-invalid-key-0001"}
     old_terms = client.post(

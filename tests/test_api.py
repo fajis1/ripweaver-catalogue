@@ -3,25 +3,41 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from ripweaver_catalogue.config import Settings
 from ripweaver_catalogue.main import create_app
-from ripweaver_catalogue.models import Base
+from ripweaver_catalogue.models import (
+    Base,
+    CatalogueDisc,
+    ConsensusAssertion,
+    ConsensusDisc,
+    QuarantinedSubmission,
+    Submission,
+)
 
 ADMIN_TOKEN = "admin-token-that-is-distinct-and-at-least-32-characters"
 CONTENT_HASH = "0123456789ABCDEF0123456789ABCDEF"
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
+def engine() -> Iterator[Engine]:
     engine = create_engine(
         "sqlite+pysqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def client(engine: Engine) -> Iterator[TestClient]:
     settings = Settings(
         database_url=SecretStr("sqlite+pysqlite://"),
         admin_token=SecretStr(ADMIN_TOKEN),
@@ -29,7 +45,6 @@ def client() -> Iterator[TestClient]:
     )
     with TestClient(create_app(settings=settings, engine=engine)) as test_client:
         yield test_client
-    engine.dispose()
 
 
 def proposal() -> dict[str, object]:
@@ -58,6 +73,13 @@ def proposal() -> dict[str, object]:
     }
 
 
+def consensus_proposal() -> dict[str, object]:
+    payload = proposal()
+    payload["schema_version"] = 2
+    payload["titles"][0]["match_source"] = "deterministic"  # type: ignore[index]
+    return payload
+
+
 def installation_headers(client: TestClient) -> dict[str, str]:
     registered = client.post("/v1/installations/register")
     assert registered.status_code == 201
@@ -84,18 +106,24 @@ def admin_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
+def row_count(session: Session, model: type[object]) -> int:
+    return int(session.scalar(select(func.count()).select_from(model)) or 0)
+
+
 def test_health_and_schema_are_public(client: TestClient) -> None:
     assert client.get("/health/live").json() == {"status": "live"}
     assert client.get("/health/ready").json() == {"status": "ready"}
     schema = client.get("/v1/schema").json()
-    assert schema["schema_version"] == 3
+    assert schema["schema_version"] == 4
     assert schema["public_lookup"] is False
     assert schema["metered_lookup"] is True
     assert schema["support_checkout"] is False
-    assert schema["automatic_piecewise_consensus"] is True
+    assert schema["automatic_piecewise_consensus"] is False
     assert schema["provisional_help"] is True
     assert schema["independent_quorum"] == 2
-    assert schema["human_moderation_required"] is False
+    assert schema["human_moderation_required"] is True
+    assert schema["submissions_quarantined"] is True
+    assert schema["quarantine_publication_enabled"] is False
     assert schema["attachments_accepted"] is False
     assert schema["media_accepted"] is False
     assert client.get("/openapi.json").status_code == 404
@@ -129,7 +157,9 @@ def test_submission_requires_authentication(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_submission_remains_private_until_approved(client: TestClient) -> None:
+def test_submission_is_quarantined_without_a_publication_path(
+    client: TestClient, engine: Engine
+) -> None:
     authentication = installation_headers(client)
     response = client.post(
         "/v1/submissions",
@@ -144,6 +174,8 @@ def test_submission_remains_private_until_approved(client: TestClient) -> None:
     receipt = response.json()
     assert receipt["content_hash"] == CONTENT_HASH
     assert receipt["status"] == "pending"
+    assert receipt["publication_eligible"] is False
+    assert receipt["validation_version"] == 1
     assert (
         client.post(
             f"/v1/lookups/discs/{CONTENT_HASH}",
@@ -153,29 +185,88 @@ def test_submission_remains_private_until_approved(client: TestClient) -> None:
         == 404
     )
 
-    pending = client.get("/v1/admin/submissions", headers=admin_headers()).json()
+    pending = client.get("/v1/admin/quarantine", headers=admin_headers()).json()
     assert [item["submission_id"] for item in pending] == [receipt["submission_id"]]
     assert "payload_json" not in pending[0]
 
-    approved = client.post(
+    cannot_approve = client.post(
         f"/v1/admin/submissions/{receipt['submission_id']}/approve",
         headers=admin_headers(),
     )
-    assert approved.status_code == 200
-    assert approved.json()["revision"] == 1
-    assert approved.json()["status"] == "reviewed"
+    assert cannot_approve.status_code == 404
 
+    with Session(engine) as session:
+        assert row_count(session, QuarantinedSubmission) == 1
+        assert row_count(session, Submission) == 0
+        assert row_count(session, ConsensusAssertion) == 0
+        assert row_count(session, ConsensusDisc) == 0
+        assert row_count(session, CatalogueDisc) == 0
+
+    usage = client.get("/v1/account/usage", headers=authentication).json()
+    assert usage["monthly_used"] == 0
+    assert usage["contribution_credits"] == 0
+
+
+def test_two_independent_schema_v2_submissions_cannot_create_consensus(
+    client: TestClient, engine: Engine
+) -> None:
+    for index in range(2):
+        response = client.post(
+            "/v1/submissions",
+            json=consensus_proposal(),
+            headers=submission_headers(
+                client, key=f"quarantine-consensus-attempt-{index:04d}"
+            ),
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "pending"
+        assert response.json()["publication_eligible"] is False
+
+    lookup_authentication = installation_headers(client)
     lookup = client.post(
         f"/v1/lookups/discs/{CONTENT_HASH}",
         json={"mode": "automatic"},
-        headers=lookup_headers(authentication, key="approved-lookup-key-0001"),
+        headers=lookup_headers(
+            lookup_authentication, key="quarantine-consensus-lookup-0001"
+        ),
     )
-    assert lookup.status_code == 200
-    assert lookup.json()["disc"]["titles"][0]["episode_number"] == 1
-    assert lookup.json()["credit_source"] == "monthly"
-    usage = client.get("/v1/account/usage", headers=authentication).json()
-    assert usage["monthly_used"] == 1
-    assert usage["contribution_credits"] == 1
+    assert lookup.status_code == 404
+    assert (
+        client.get(
+            f"/v1/help/discs/{CONTENT_HASH}", headers=lookup_authentication
+        ).status_code
+        == 404
+    )
+
+    with Session(engine) as session:
+        assert row_count(session, QuarantinedSubmission) == 2
+        assert row_count(session, Submission) == 0
+        assert row_count(session, ConsensusAssertion) == 0
+        assert row_count(session, ConsensusDisc) == 0
+        assert row_count(session, CatalogueDisc) == 0
+
+
+def test_database_refuses_to_mark_quarantine_as_publishable(
+    client: TestClient, engine: Engine
+) -> None:
+    foreign_key_targets = {
+        element.target_fullname
+        for constraint in QuarantinedSubmission.__table__.foreign_key_constraints
+        for element in constraint.elements
+    }
+    assert foreign_key_targets == {"installations.installation_id"}
+
+    created = client.post(
+        "/v1/submissions",
+        json=consensus_proposal(),
+        headers=submission_headers(client, key="quarantine-state-constraint-0001"),
+    ).json()
+    with Session(engine) as session:
+        row = session.get(QuarantinedSubmission, created["submission_id"])
+        assert row is not None
+        row.status = "approved"
+        with pytest.raises(IntegrityError):
+            session.commit()
 
 
 def test_idempotency_key_cannot_be_reused_for_different_payload(
@@ -218,6 +309,72 @@ def test_submission_rejects_unknown_private_fields(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("content_type", "content_encoding", "expected_status"),
+    [
+        ("text/plain", None, 415),
+        ("application/json", "gzip", 415),
+    ],
+)
+def test_submission_rejects_unsafe_transport_envelopes(
+    client: TestClient,
+    content_type: str,
+    content_encoding: str | None,
+    expected_status: int,
+) -> None:
+    headers = {
+        **submission_headers(client, key=f"transport-rejection-{expected_status:04d}"),
+        "Content-Type": content_type,
+    }
+    if content_encoding is not None:
+        headers["Content-Encoding"] = content_encoding
+    response = client.post("/v1/submissions", content=b"{}", headers=headers)
+    assert response.status_code == expected_status
+
+
+def test_submission_rejects_duplicate_json_keys(client: TestClient) -> None:
+    raw = (
+        b'{"schema_version":2,"schema_version":1,'
+        b'"content_hash":"0123456789ABCDEF0123456789ABCDEF"}'
+    )
+    response = client.post(
+        "/v1/submissions",
+        content=raw,
+        headers={
+            **submission_headers(client, key="duplicate-json-key-0001"),
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_submission_rejects_oversized_body_before_json_validation(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/v1/submissions",
+        content=b"{" + (b" " * (256 * 1024)),
+        headers={
+            **submission_headers(client, key="oversized-body-key-0001"),
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 413
+
+
+def test_submission_rejects_control_characters_in_public_text(
+    client: TestClient,
+) -> None:
+    payload = proposal()
+    payload["release_name"] = "Synthetic\nInjected"
+    response = client.post(
+        "/v1/submissions",
+        json=payload,
+        headers=submission_headers(client, key="control-character-key-0001"),
+    )
+    assert response.status_code == 422
+
+
 def test_admin_can_reject_with_path_free_reason(client: TestClient) -> None:
     created = client.post(
         "/v1/submissions",
@@ -225,7 +382,7 @@ def test_admin_can_reject_with_path_free_reason(client: TestClient) -> None:
         headers=submission_headers(client, key="rejection-idempotency-key-0001"),
     ).json()
     rejected = client.post(
-        f"/v1/admin/submissions/{created['submission_id']}/reject",
+        f"/v1/admin/quarantine/{created['submission_id']}/reject",
         json={"reason_code": "conflicting_playlist_map"},
         headers=admin_headers(),
     )

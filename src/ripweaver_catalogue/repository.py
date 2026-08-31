@@ -57,15 +57,27 @@ def _receipt(session: Session, row: Submission) -> SubmissionReceipt:
     )
 
 
-def submit_proposal(
+def record_trusted_legacy_proposal(
     session: Session,
     payload: DiscSubmissionInput,
     *,
+    trusted_internal: bool,
     installation_id: str | None,
     idempotency_key: str,
     client_version: str,
     consensus_credit_threshold: float = 0.90,
 ) -> SubmissionReceipt:
+    """Seed historical reviewed/consensus data outside the public ingest path.
+
+    Public requests must use ``quarantine_submission`` instead. This explicit
+    guard prevents an accidental route binding from silently restoring the old
+    untrusted-input-to-consensus path.
+    """
+
+    if trusted_internal is not True:
+        raise CatalogueConflictError(
+            "Legacy catalogue writes require an explicit trusted internal caller"
+        )
     encoded, payload_sha256 = canonical_payload(payload)
     idempotency_sha256 = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
     existing = session.scalar(

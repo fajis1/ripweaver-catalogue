@@ -1,39 +1,59 @@
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from ripweaver_catalogue.config import Settings
 from ripweaver_catalogue.main import create_app
 from ripweaver_catalogue.models import Base
+from ripweaver_catalogue.repository import record_trusted_legacy_proposal
+from ripweaver_catalogue.schemas import DiscSubmissionInput, SubmissionReceipt
 
 CONTENT_HASH = "ABCDEF0123456789ABCDEF0123456789"
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
+def engine() -> Iterator[Engine]:
     engine = create_engine(
         "sqlite+pysqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def client(engine: Engine) -> Iterator[TestClient]:
     settings = Settings(
         database_url=SecretStr("sqlite+pysqlite://"),
         allowed_hosts=["testserver"],
     )
     with TestClient(create_app(settings=settings, engine=engine)) as test_client:
         yield test_client
-    engine.dispose()
 
 
-def register(client: TestClient) -> dict[str, str]:
+@dataclass(frozen=True)
+class InstallationAuth:
+    installation_id: str
+    headers: dict[str, str]
+
+
+def register(client: TestClient) -> InstallationAuth:
     response = client.post("/v1/installations/register")
     assert response.status_code == 201
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    receipt = response.json()
+    return InstallationAuth(
+        installation_id=receipt["installation_id"],
+        headers={"Authorization": f"Bearer {receipt['access_token']}"},
+    )
 
 
 def episode(
@@ -75,48 +95,50 @@ def proposal(
 
 
 def submit(
-    client: TestClient,
-    authentication: dict[str, str],
+    engine: Engine,
+    authentication: InstallationAuth,
     payload: dict[str, object],
     *,
     key: str,
-):
-    return client.post(
-        "/v1/submissions",
-        json=payload,
-        headers={
-            **authentication,
-            "Idempotency-Key": key,
-            "X-RipWeaver-Version": "consensus-test",
-        },
-    )
+) -> SubmissionReceipt:
+    with Session(engine) as session:
+        return record_trusted_legacy_proposal(
+            session,
+            DiscSubmissionInput.model_validate(payload),
+            trusted_internal=True,
+            installation_id=authentication.installation_id,
+            idempotency_key=key,
+            client_version="legacy-consensus-test",
+        )
 
 
-def lookup(client: TestClient, authentication: dict[str, str], *, key: str):
+def lookup(client: TestClient, authentication: InstallationAuth, *, key: str):
     return client.post(
         f"/v1/lookups/discs/{CONTENT_HASH}",
         json={"mode": "automatic"},
-        headers={**authentication, "Idempotency-Key": key},
+        headers={**authentication.headers, "Idempotency-Key": key},
     )
 
 
 def test_one_upload_is_help_only_and_two_matching_uploads_confirm(
-    client: TestClient,
+    client: TestClient, engine: Engine
 ) -> None:
     first_user = register(client)
     first = submit(
-        client,
+        engine,
         first_user,
         proposal([episode(1, 1)]),
         key="consensus-first-upload-0001",
     )
-    assert first.status_code == 202
-    assert first.json()["status"] == "accepted"
-    assert first.json()["consensus"]["items"][0]["state"] == "candidate"
+    assert first.status == "accepted"
+    assert first.consensus is not None
+    assert first.consensus.items[0].state.value == "candidate"
     candidate_lookup = lookup(client, first_user, key="candidate-lookup-key-0001")
     assert candidate_lookup.status_code == 404
 
-    help_response = client.get(f"/v1/help/discs/{CONTENT_HASH}", headers=first_user)
+    help_response = client.get(
+        f"/v1/help/discs/{CONTENT_HASH}", headers=first_user.headers
+    )
     assert help_response.status_code == 200
     candidate = help_response.json()["items"][0]["candidates"][0]
     assert candidate["independent_support"] == 1
@@ -124,32 +146,34 @@ def test_one_upload_is_help_only_and_two_matching_uploads_confirm(
 
     second_user = register(client)
     second = submit(
-        client,
+        engine,
         second_user,
         proposal([episode(1, 1)]),
         key="consensus-second-upload-0002",
     )
-    assert second.status_code == 202
-    assert second.json()["consensus"]["complete"] is True
+    assert second.consensus is not None
+    assert second.consensus.complete is True
     confirmed = lookup(client, register(client), key="confirmed-lookup-key-0002")
     assert confirmed.status_code == 200
     assert confirmed.json()["disc"]["status"] == "consensus"
     assert confirmed.json()["disc"]["titles"][0]["episode_number"] == 1
     assert (
-        client.get("/v1/account/usage", headers=first_user).json()[
+        client.get("/v1/account/usage", headers=first_user.headers).json()[
             "contribution_credits"
         ]
         == 1
     )
     assert (
-        client.get("/v1/account/usage", headers=second_user).json()[
+        client.get("/v1/account/usage", headers=second_user.headers).json()[
             "contribution_credits"
         ]
         == 1
     )
 
 
-def test_strict_lead_self_heals_two_way_conflicts(client: TestClient) -> None:
+def test_strict_lead_self_heals_two_way_conflicts(
+    client: TestClient, engine: Engine
+) -> None:
     users = [register(client) for _index in range(5)]
     assignments = [1, 2, 1, 2, 2]
     expected_states = ["candidate", "disputed", "confirmed", "disputed", "confirmed"]
@@ -157,13 +181,13 @@ def test_strict_lead_self_heals_two_way_conflicts(client: TestClient) -> None:
         zip(users, assignments, expected_states, strict=True), start=1
     ):
         response = submit(
-            client,
+            engine,
             user,
             proposal([episode(1, assignment)]),
             key=f"conflict-submission-key-{index:04d}",
         )
-        assert response.status_code == 202
-        assert response.json()["consensus"]["items"][0]["state"] == expected
+        assert response.consensus is not None
+        assert response.consensus.items[0].state.value == expected
         looked_up = lookup(
             client, register(client), key=f"conflict-lookup-key-{index:04d}"
         )
@@ -177,18 +201,18 @@ def test_strict_lead_self_heals_two_way_conflicts(client: TestClient) -> None:
 
 
 def test_latest_full_disc_submission_replaces_one_installations_old_vote(
-    client: TestClient,
+    client: TestClient, engine: Engine
 ) -> None:
     first_user = register(client)
     second_user = register(client)
     submit(
-        client,
+        engine,
         first_user,
         proposal([episode(1, 1)]),
         key="replacement-first-user-0001",
     )
     submit(
-        client,
+        engine,
         second_user,
         proposal([episode(1, 1)]),
         key="replacement-second-user-0002",
@@ -201,12 +225,13 @@ def test_latest_full_disc_submission_replaces_one_installations_old_vote(
     )
 
     replacement = submit(
-        client,
+        engine,
         second_user,
         proposal([episode(1, 2)]),
         key="replacement-second-user-0003",
     )
-    assert replacement.json()["consensus"]["items"][0]["state"] == "disputed"
+    assert replacement.consensus is not None
+    assert replacement.consensus.items[0].state.value == "disputed"
     assert (
         lookup(
             client, register(client), key="replacement-disputed-lookup-0002"
@@ -214,7 +239,7 @@ def test_latest_full_disc_submission_replaces_one_installations_old_vote(
         == 404
     )
     assert (
-        client.get("/v1/account/usage", headers=second_user).json()[
+        client.get("/v1/account/usage", headers=second_user.headers).json()[
             "contribution_credits"
         ]
         == 1
@@ -222,7 +247,7 @@ def test_latest_full_disc_submission_replaces_one_installations_old_vote(
 
 
 def test_piecewise_layout_keeps_safe_majority_and_prefers_manual_bonus_name(
-    client: TestClient,
+    client: TestClient, engine: Engine
 ) -> None:
     first_titles = [episode(index, index) for index in range(1, 19)]
     second_titles = [episode(index, index) for index in range(1, 19)]
@@ -252,13 +277,13 @@ def test_piecewise_layout_keeps_safe_majority_and_prefers_manual_bonus_name(
     second_titles.append(episode(20, 21))
 
     submit(
-        client,
+        engine,
         register(client),
         proposal(first_titles),
         key="piecewise-first-upload-0001",
     )
     submit(
-        client,
+        engine,
         register(client),
         proposal(second_titles),
         key="piecewise-second-upload-0002",
@@ -278,16 +303,18 @@ def test_piecewise_layout_keeps_safe_majority_and_prefers_manual_bonus_name(
     assert unresolved["state"] == "disputed"
 
 
-def test_server_assisted_observation_never_forms_quorum(client: TestClient) -> None:
+def test_server_assisted_observation_never_forms_quorum(
+    client: TestClient, engine: Engine
+) -> None:
     assisted_installation = register(client)
     submit(
-        client,
+        engine,
         register(client),
         proposal([episode(1, 1)]),
         key="independent-upload-key-0001",
     )
     submit(
-        client,
+        engine,
         assisted_installation,
         proposal([episode(1, 1, match_source="server_assisted")]),
         key="assisted-upload-key-0002",
@@ -295,13 +322,13 @@ def test_server_assisted_observation_never_forms_quorum(client: TestClient) -> N
     assisted_lookup = lookup(client, register(client), key="assisted-lookup-key-0003")
     assert assisted_lookup.status_code == 404
     help_response = client.get(
-        f"/v1/help/discs/{CONTENT_HASH}", headers=register(client)
+        f"/v1/help/discs/{CONTENT_HASH}", headers=register(client).headers
     ).json()
     candidate = help_response["items"][0]["candidates"][0]
     assert candidate["independent_support"] == 1
     assert candidate["total_observations"] == 2
     assert (
-        client.get("/v1/account/usage", headers=assisted_installation).json()[
+        client.get("/v1/account/usage", headers=assisted_installation.headers).json()[
             "contribution_credits"
         ]
         == 0
@@ -309,12 +336,12 @@ def test_server_assisted_observation_never_forms_quorum(client: TestClient) -> N
 
 
 def test_whole_disc_consistency_holds_only_duplicate_episode_items(
-    client: TestClient,
+    client: TestClient, engine: Engine
 ) -> None:
     titles = [episode(1, 1), episode(2, 1), episode(3, 2)]
     for index in range(2):
         submit(
-            client,
+            engine,
             register(client),
             proposal(titles),
             key=f"duplicate-episode-upload-{index:04d}",

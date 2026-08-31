@@ -1,12 +1,23 @@
 """Path-free public protocol schemas."""
 
 import re
+import unicodedata
 from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ContentHash = Annotated[str, Field(pattern=r"^[0-9A-Fa-f]{32}$")]
+
+
+def _validated_public_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value:
+        raise ValueError("public metadata text cannot be empty")
+    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+        raise ValueError("public metadata text contains control characters")
+    return value
 
 
 class StrictModel(BaseModel):
@@ -62,6 +73,16 @@ class DiscTitleInput(StrictModel):
     contained_title_indexes: tuple[int, ...] = Field(default=(), max_length=1000)
     match_source: MatchSource | None = None
 
+    @field_validator(
+        "series_name",
+        "episode_title",
+        "movie_title",
+        "display_title",
+    )
+    @classmethod
+    def text_must_be_display_safe(cls, value: str | None) -> str | None:
+        return _validated_public_text(value)
+
     @field_validator("source_file")
     @classmethod
     def source_file_must_be_path_free(cls, value: str) -> str:
@@ -76,6 +97,8 @@ class DiscTitleInput(StrictModel):
     def segment_map_must_be_structural(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if any(re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", item) is None for item in value):
             raise ValueError("segment_map contains an invalid identifier")
+        if len(value) != len(set(value)):
+            raise ValueError("segment_map identifiers must be unique")
         return value
 
     @model_validator(mode="after")
@@ -125,12 +148,17 @@ class DiscSubmissionInput(StrictModel):
     media_type: MediaType
     release_name: str | None = Field(default=None, max_length=300)
     edition: str | None = Field(default=None, max_length=200)
-    titles: tuple[DiscTitleInput, ...] = Field(min_length=1, max_length=1000)
+    titles: tuple[DiscTitleInput, ...] = Field(min_length=1, max_length=512)
 
     @field_validator("content_hash")
     @classmethod
     def normalize_hash(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("release_name", "edition")
+    @classmethod
+    def disc_text_must_be_display_safe(cls, value: str | None) -> str | None:
+        return _validated_public_text(value)
 
     @model_validator(mode="after")
     def title_indexes_must_be_unique(self) -> "DiscSubmissionInput":
@@ -145,6 +173,22 @@ class DiscSubmissionInput(StrictModel):
         for title in self.titles:
             if not set(title.contained_title_indexes).issubset(available):
                 raise ValueError("contained title indexes must exist on the same disc")
+        containment = {
+            title.title_index: set(title.contained_title_indexes)
+            for title in self.titles
+            if title.contained_title_indexes
+        }
+        for start in containment:
+            pending = list(containment[start])
+            visited: set[int] = set()
+            while pending:
+                current = pending.pop()
+                if current == start:
+                    raise ValueError("contained title indexes cannot form a cycle")
+                if current in visited:
+                    continue
+                visited.add(current)
+                pending.extend(containment.get(current, ()))
         return self
 
 
@@ -175,6 +219,22 @@ class SubmissionReceipt(StrictModel):
 
 
 class SubmissionSummary(SubmissionReceipt):
+    client_version: str
+    rejection_code: str | None
+    created_at: str
+    reviewed_at: str | None
+
+
+class QuarantineReceipt(StrictModel):
+    submission_id: str
+    content_hash: str
+    payload_sha256: str
+    status: Literal["pending", "rejected"]
+    validation_version: Literal[1] = 1
+    publication_eligible: Literal[False] = False
+
+
+class QuarantineSummary(QuarantineReceipt):
     client_version: str
     rejection_code: str | None
     created_at: str

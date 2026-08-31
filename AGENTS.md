@@ -15,10 +15,17 @@ This service is a public metadata boundary. Preserve these rules:
   amount, idempotent webhook and must never be granted from a browser redirect.
 - Support payments are disabled by default. Never enable them, contact Stripe,
   or use live payment credentials during tests.
-- Schema-v2 contributions are accepted automatically. A title is confirmed
-  only when at least two independent installations submit the same structural
-  identity and semantic assignment and that group strictly leads every
-  alternative. Ties are disputed and must suspend that title only.
+- Every public schema-v1 or schema-v2 submission is untrusted input. It must
+  pass the bounded strict JSON validator and enter only the separate
+  `submission_quarantine` table. Quarantine status is limited by a database
+  constraint to `pending` or `rejected`; quarantine rows have no approval,
+  consensus, revision, credit, or public-lookup path.
+- Historical automatic-consensus tables and reviewed revisions remain readable
+  for backward compatibility. New public submissions must never create or
+  update consensus assertions, consensus discs/items, catalogue revisions, or
+  contribution credits. Tests for the historical engine must seed it directly
+  through the explicitly guarded trusted-internal boundary, never through the
+  public API.
 - Server-assisted matches may be returned as provisional help but never count
   toward quorum or contribution credit. Evidence provenance may select a
   display label inside one semantic group, but may never break a semantic vote
@@ -30,8 +37,9 @@ This service is a public metadata boundary. Preserve these rules:
   disc fingerprint, and require the configured fraction of that installation's
   independent assertions to participate in confirmed winners. They are never
   clawed back if later evidence changes consensus.
-- Schema-v1 pending moderation remains only for backward compatibility with
-  legacy reviewed revisions; new clients must use automatic schema v2.
+- Schema-v1 legacy moderation remains only for rows already in the historical
+  `submissions` table. An ID returned by the public quarantine endpoint must be
+  unknown to every legacy approval route.
 - Keep credentials in ignored environment state; never open, print, or commit
   `.env`.
 - Database migrations must be explicit and reviewable. Do not auto-create or

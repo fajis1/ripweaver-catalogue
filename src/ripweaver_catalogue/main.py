@@ -29,24 +29,32 @@ from .auth import bearer_dependency
 from .config import Settings, get_settings
 from .consensus import get_consensus_help
 from .database import build_engine, build_session_factory, session_dependency
+from .ingest import SubmissionEnvelopeError, parse_submission_request
 from .models import Installation
 from .payments import CheckoutProvider, PaymentProviderError, StripeCheckoutProvider
+from .quarantine import (
+    QuarantineConflictError,
+    QuarantineNotFoundError,
+    list_quarantine,
+    quarantine_submission,
+    reject_quarantined_submission,
+)
 from .repository import (
     CatalogueConflictError,
     CatalogueNotFoundError,
     approve_submission,
     list_submissions,
     reject_submission,
-    submit_proposal,
 )
 from .schemas import (
     DiscHelpRecord,
     DiscRecord,
-    DiscSubmissionInput,
     InstallationReceipt,
     LookupRequest,
     LookupResponse,
     PaymentWebhookReceipt,
+    QuarantineReceipt,
+    QuarantineSummary,
     RejectionRequest,
     SubmissionReceipt,
     SubmissionSummary,
@@ -60,19 +68,21 @@ from .support import build_support_policy
 
 
 class SchemaCapabilities(BaseModel):
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
     service_version: str
     public_lookup: bool = False
     installation_registration: bool = True
     metered_lookup: bool = True
     manual_lookup_after_prompt: bool = True
-    contribution_credits: bool = True
+    contribution_credits: bool = False
     support_checkout: bool
     authenticated_submissions: bool = True
-    automatic_piecewise_consensus: bool = True
+    automatic_piecewise_consensus: bool = False
     provisional_help: bool = True
     independent_quorum: Literal[2] = 2
-    human_moderation_required: bool = False
+    human_moderation_required: bool = True
+    submissions_quarantined: bool = True
+    quarantine_publication_enabled: bool = False
     attachments_accepted: bool = False
     media_accepted: bool = False
 
@@ -195,7 +205,7 @@ def create_app(
             prompt = SupportRequired(
                 message=(
                     "Automatic lookup credits are exhausted. Support RipWeaver, "
-                    "contribute a reviewed disc, or continue this lookup manually."
+                    "or continue this lookup manually."
                 ),
                 usage=exc.usage,
                 policy=build_support_policy(selected_settings),
@@ -288,32 +298,77 @@ def create_app(
 
     @application.post(
         "/v1/submissions",
-        response_model=SubmissionReceipt,
+        response_model=QuarantineReceipt,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    def create_submission(
-        payload: DiscSubmissionInput,
+    async def create_submission(
+        request: Request,
         idempotency_key: Annotated[
-            str, Header(alias="Idempotency-Key", min_length=16, max_length=200)
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=16,
+                max_length=200,
+                pattern=r"^[A-Za-z0-9._:-]+$",
+            ),
         ],
         client_version: Annotated[
-            str, Header(alias="X-RipWeaver-Version", min_length=1, max_length=64)
+            str,
+            Header(
+                alias="X-RipWeaver-Version",
+                min_length=1,
+                max_length=64,
+                pattern=r"^[A-Za-z0-9._+-]+$",
+            ),
         ],
         session: SessionDependency,
         installation: Annotated[Installation, Depends(require_installation)],
-    ) -> SubmissionReceipt:
+    ) -> QuarantineReceipt:
         try:
-            return submit_proposal(
+            payload = await parse_submission_request(request)
+            return quarantine_submission(
                 session,
                 payload,
                 installation_id=installation.installation_id,
                 idempotency_key=idempotency_key,
                 client_version=client_version,
-                consensus_credit_threshold=(
-                    selected_settings.consensus_credit_threshold
-                ),
             )
-        except CatalogueConflictError as exc:
+        except SubmissionEnvelopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except QuarantineConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.get(
+        "/v1/admin/quarantine",
+        response_model=tuple[QuarantineSummary, ...],
+        dependencies=[Depends(require_admin)],
+    )
+    def quarantined_submissions(
+        session: SessionDependency,
+        submission_status: Annotated[
+            Literal["pending", "rejected"], Query(alias="status")
+        ] = "pending",
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> tuple[QuarantineSummary, ...]:
+        return list_quarantine(session, status=submission_status, limit=limit)
+
+    @application.post(
+        "/v1/admin/quarantine/{submission_id}/reject",
+        response_model=QuarantineReceipt,
+        dependencies=[Depends(require_admin)],
+    )
+    def reject_quarantine(
+        submission_id: str,
+        rejection: RejectionRequest,
+        session: SessionDependency,
+    ) -> QuarantineReceipt:
+        try:
+            return reject_quarantined_submission(
+                session, submission_id, reason_code=rejection.reason_code
+            )
+        except QuarantineNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except QuarantineConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @application.get(

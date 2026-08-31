@@ -8,20 +8,34 @@ Cloudflare Tunnel.
 
 The API accepts structural disc metadata only: a content identifier, media
 type, source playlist/file identifiers, segment maps, runtimes, sizes, match
-provenance, and movie/episode classifications. Validation rejects local paths and the
-schema has no fields for media, transcripts, screenshots, drive serials,
-Jellyfin details, credentials, or command output.
+provenance, and movie/episode classifications. The submission boundary accepts
+only bounded, uncompressed JSON; it rejects duplicate keys, excessive size or
+nesting, unknown fields, control characters, local paths, and invalid structural
+relationships. The schema has no fields for media, transcripts, screenshots,
+drive serials, Jellyfin details, credentials, or command output.
 
 Lookups return only legacy approved revisions or title-level results confirmed
-by automatic consensus. Each RipWeaver installation receives an opaque bearer
-token; only its SHA-256 digest is stored by the server. Submissions from current
-clients are evaluated automatically and need no owner moderation. Provider
-secrets and the database URL are loaded from `.env` and are never stored in API
-records or responses.
+before the quarantine boundary. Each RipWeaver installation receives an opaque
+bearer token; only its SHA-256 digest is stored by the server. Every new public
+submission is stored in the separate `submission_quarantine` table with status
+`pending`. A database constraint permits only `pending` or `rejected`, and the
+table has no relationship or code path to consensus assertions, reviewed
+revisions, contribution credits, or public lookup results. Provider secrets and
+the database URL are loaded from `.env` and are never stored in API records or
+responses.
+
+The public protocol advertises schema version 4,
+`submissions_quarantined: true`, and
+`quarantine_publication_enabled: false`. Quarantine is deliberately a holding
+boundary, not a moderation queue: there is a reject action but no approve or
+publish action.
 
 ## Hybrid consensus
 
-Consensus is piecewise rather than all-or-nothing. Each title index first needs
+The historical consensus engine is piecewise rather than all-or-nothing. It is
+retained so already-confirmed records remain readable and its behavior remains
+covered by isolated tests. Public submissions no longer feed it. Each title
+index first needs
 agreement on its structural identity (playlist, segment map, runtime, and size),
 then on its semantic assignment. A winner requires at least two independent
 installations and must strictly lead the runner-up. One matching upload is only
@@ -46,8 +60,9 @@ help, that layout receives no exchange credit.
 ## Lookup credits and voluntary support
 
 Each installation receives 10 automatic successful catalogue lookups per UTC
-calendar month. A qualifying consensus contribution earns one non-expiring
-automatic lookup credit. Failed and not-found lookups do not consume anything. After the
+calendar month. Previously issued contribution credits remain spendable, but
+quarantined submissions do not earn new credits. Failed and not-found lookups
+do not consume anything. After the
 monthly allowance and earned or purchased credits are exhausted, the API
 returns a visible support-required decision; the person may still continue that
 specific lookup manually without paying.
@@ -136,7 +151,9 @@ be copied, encrypted, to storage outside the VM and tested with a restore drill.
 - `GET /v1/help/discs/{content_hash}` — unmetered provisional candidate help
 - `POST /v1/support/checkout` — disabled-until-configured hosted checkout
 - `POST /v1/payments/stripe/webhook` — signature-verified fulfillment boundary
-- `POST /v1/submissions` — authenticated automatic schema-v2 contribution
+- `POST /v1/submissions` — strict authenticated pending-only quarantine ingest
+- `GET /v1/admin/quarantine` — private path-free quarantine summary
+- `POST /v1/admin/quarantine/{id}/reject` — reject; there is no approve action
 - `GET /v1/admin/submissions` — legacy schema-v1 moderation list
 - `POST /v1/admin/submissions/{id}/approve` — publish a legacy revision
 - `POST /v1/admin/submissions/{id}/reject` — reject a legacy proposal

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
@@ -122,6 +123,40 @@ class Submission(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     idempotency_key_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     client_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    rejection_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class QuarantinedSubmission(Base):
+    """Validated public input with no relationship to publication tables."""
+
+    __tablename__ = "submission_quarantine"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'rejected')",
+            name="ck_submission_quarantine_status",
+        ),
+        UniqueConstraint(
+            "installation_id",
+            "idempotency_key_sha256",
+            name="uq_quarantine_installation_idempotency",
+        ),
+    )
+
+    submission_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.installation_id"), nullable=False, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    validation_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     rejection_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
